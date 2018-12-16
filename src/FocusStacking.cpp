@@ -3,49 +3,17 @@
 #include <iomanip>
 #include <sstream>
 
-constexpr int FocusStacking::LAPLACIAN[3][3];
-
-std::string type2str(int type) {
-    std::string r;
-
-    uchar depth = type & CV_MAT_DEPTH_MASK;
-    uchar chans = 1 + (type >> CV_CN_SHIFT);
-
-    switch (depth) {
-        case CV_8U: r = "8U";
-            break;
-        case CV_8S: r = "8S";
-            break;
-        case CV_16U: r = "16U";
-            break;
-        case CV_16S: r = "16S";
-            break;
-        case CV_32S: r = "32S";
-            break;
-        case CV_32F: r = "32F";
-            break;
-        case CV_64F: r = "64F";
-            break;
-        default: r = "User";
-            break;
-    }
-
-    r += "C";
-    r += (chans + '0');
-
-    return r;
-}
-
 FocusStacking::FocusStacking(std::string inDir, std::string outDir) : outDir(outDir) {
+    //reading could be done by multiple threads
     for (int i = 0; i < 13; i++) {
         imageStackColor.push_back(cv::imread(inDir + getPathFromIndex(i), CV_LOAD_IMAGE_COLOR));
-
         if (imageStackColor.back().empty()) {
             throw std::invalid_argument("Bad file:" + inDir + getPathFromIndex(i));
         }
-        imageStackGray.push_back(cv::imread(inDir + getPathFromIndex(i), CV_LOAD_IMAGE_GRAYSCALE));
+        imageStackGray.emplace_back(imageStackColor.back());
     }
-    std::cout << type2str(imageStackColor[0].type()) << " " << type2str(imageStackGray[0].type());
+    //just create tmp,
+    tmp = Matrix8U(imageStackColor[0].rows, imageStackColor[0].cols);
 }
 
 std::string FocusStacking::getPathFromIndex(int i) {
@@ -55,42 +23,56 @@ std::string FocusStacking::getPathFromIndex(int i) {
 }
 
 void FocusStacking::generateResult() {
+    /*
+     * For every image:
+     * 1) convert to gray scale (in constructor)
+     * 2) blur with simple averaging
+     * 3) apply laplacian operator to detect edges (edges are visible in sharp parts
+     * 4) blur result
+     */
     for (auto & m : imageStackGray) {
-        cv::blur(m, tmp, cv::Size(3, 3));
-        cv::Laplacian(tmp, m, CV_8U, 1, 1);
-        cv::blur(m, tmp, cv::Size(7, 7));
+        Matrix8U::blur(m, tmp, 3);
+        Matrix8U::laplacian(tmp, m);
+        Matrix8U::blur(m, tmp, 7);
         tmp.copyTo(m);
     }
-    imageStackColor[0].copyTo(resultSharp);
-    imageStackGray[0].copyTo(resultDepth);
+
+    resultSharp = cv::Mat(imageStackColor[0].rows, imageStackColor[0].cols, CV_8UC3);
+    resultDepth = cv::Mat(imageStackColor[0].rows, imageStackColor[0].cols, CV_8UC1);
+
+    /*
+     * For every pixel use the sharpest pixel (measured by value of imageStackGray[i])
+     *
+     */
     for (int i = 0; i < resultSharp.rows; i++) {
         for (int j = 0; j < resultSharp.cols; j++) {
+
             size_t best = 0; //best photo for given pixel
             uchar maxVal = 0;
             for (size_t im = 0; im < imageStackGray.size(); im++) {
-                if (imageStackGray[im].at<uchar>(i, j) > maxVal) {
-                    maxVal = imageStackGray[im].at<uchar>(i, j);
+                if (imageStackGray[im].at(i, j) > maxVal) {
+                    maxVal = imageStackGray[im].at(i, j);
                     best = im;
                 }
             }
             resultSharp.at<cv::Vec3b>(i, j) = imageStackColor[best].at<cv::Vec3b>(i, j);
-            const int THRESHOLD = 3;
+            const int THRESHOLD = 8;
             if (maxVal < THRESHOLD) {
+                //it is noise probably
                 resultDepth.at<uchar>(i, j) = maxVal;
             } else {
-                resultDepth.at<uchar>(i, j) = THRESHOLD + (255 - THRESHOLD) * (1 - (float) best / imageStackGray.size());
+                // map index of photo to value of depth
+                //to use more than 13 values some weighted average could be used
+                //instead of taking max
+                resultDepth.at<uchar>(i, j) = THRESHOLD +
+                        (255 - THRESHOLD) * (1 - (float) best / imageStackGray.size());
             }
         }
     }
-
 }
 
 void FocusStacking::writeResult() {
     std::vector<int> compressionParams{CV_IMWRITE_PNG_COMPRESSION, 9};
-    int i = 0;
-    for (auto & m : imageStackGray) {
-        cv::imwrite(outDir + "result" + std::to_string(i++) + ".png", m, compressionParams);
-    }
     cv::imwrite(outDir + "resultSharp.png", resultSharp, compressionParams);
     cv::imwrite(outDir + "resultDepth.png", resultDepth, compressionParams);
 }
